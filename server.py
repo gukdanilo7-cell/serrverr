@@ -17,6 +17,7 @@ lobbies: dict = {}
 matches: dict = {}
 queues: dict = {"first_win": [], "first_die": [], "roles": []}
 rooms: dict = {}  # match_id -> {user: {x,y,nick,...}}
+wait_rooms: dict = {}  # code -> {host, players, mode, ranked, created}
 
 # Persist accounts so Render restarts / sleep don't wipe friends & elo
 DATA_DIR = os.environ.get("DATA_DIR", ".")
@@ -89,12 +90,18 @@ def public_user(u, full=False):
     rec = users.get(u) or {}
     now = time.time()
     online = (now - rec.get("online", 0)) < ONLINE_TTL
+    act = rec.get("activity") or "idle"
+    if not online:
+        act = "offline"
     out = {
         "user": u,
         "nick": rec.get("nick", u),
         "elo": int(rec.get("elo", 1000)),
         "online": online,
         "avatar": rec.get("avatar") or "",
+        "activity": act,  # offline|idle|queue|wait|play
+        "match_id": rec.get("match_id") or "",
+        "lobby_code": rec.get("lobby_code") or "",
     }
     if full:
         st = rec.get("stats") or {}
@@ -119,6 +126,14 @@ def public_user(u, full=False):
         ]
     return out
 
+
+
+def set_activity(u, act, match_id="", lobby_code=""):
+    if u in users:
+        users[u]["activity"] = act
+        users[u]["match_id"] = match_id or ""
+        users[u]["lobby_code"] = lobby_code or ""
+        users[u]["online"] = time.time()
 
 def touch(u):
     if u in users:
@@ -217,7 +232,44 @@ def finish_match(m, winner, loser):
         sl["games"] = int(sl.get("games", 0)) + 1
         sl["streak"] = 0
         save_users()
+        try:
+            set_activity(winner, "idle")
+            set_activity(loser, "idle")
+        except Exception:
+            pass
 
+
+
+def _start_wait_match(w, code_s):
+    pl = list(w.get("players") or [])
+    if len(pl) < 2:
+        return None
+    mode = w.get("mode") or "roles"
+    mid = uuid.uuid4().hex[:12]
+    roles = {}
+    if mode == "roles":
+        thrower = random.choice(pl)
+        for p in pl:
+            roles[p] = "thrower" if p == thrower else "runner"
+    else:
+        for p in pl:
+            roles[p] = "runner"
+    start_at = time.time() + 3.0
+    a, b = pl[0], pl[1]
+    matches[mid] = {
+        "id": mid, "a": a, "b": b, "players": list(pl), "mode": mode,
+        "status": "countdown", "ranked": bool(w.get("ranked", True)),
+        "roles": roles,
+        "events": {p: None for p in pl},
+        "pos": {p: None for p in pl},
+        "blocks": [], "block_seq": 0,
+        "start_at": start_at, "started": start_at,
+        "winner": None, "loser": None, "alive": list(pl),
+    }
+    w["match_id"] = mid
+    for p in pl:
+        set_activity(p, "play", match_id=mid, lobby_code=code_s)
+    return matches[mid]
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -326,6 +378,22 @@ class Handler(BaseHTTPRequestHandler):
                         "block_seq": m.get("block_seq", 0),
                         "start_at": m.get("start_at"),
                         "server_now": time.time(),
+                    })
+            elif path == "/api/wait":
+                code_s = (qs.get("code") or [""])[0].upper()
+                w = wait_rooms.get(code_s)
+                if not w:
+                    code, body = j({"error": "not found"}, 404)
+                else:
+                    code, body = j({
+                        "code": code_s,
+                        "players": [public_user(p) for p in w.get("players", [])],
+                        "mode": w.get("mode"),
+                        "ranked": w.get("ranked", True),
+                        "match_id": w.get("match_id"),
+                        "waiting": not w.get("match_id") and len(w.get("players", [])) < 2,
+                        "start_at": (matches.get(w["match_id"]) or {}).get("start_at") if w.get("match_id") else None,
+                        "roles": (matches.get(w["match_id"]) or {}).get("roles") if w.get("match_id") else None,
                     })
             elif path == "/api/online":
                 now = time.time()
@@ -557,9 +625,12 @@ class Handler(BaseHTTPRequestHandler):
                         if user in q:
                             q.remove(user)
                     queues[mode].append(user)
+                    set_activity(user, "queue")
                     touch(user)
                     m = try_matchmake(mode)
                     if m:
+                        for p in m.get("players") or [m["a"], m["b"]]:
+                            set_activity(p, "play", match_id=m["id"])
                         opp = m["b"] if m["a"] == user else m["a"]
                         code, body = j({
                             "ok": True, "matched": True, "match_id": m["id"],
@@ -580,6 +651,68 @@ class Handler(BaseHTTPRequestHandler):
                 for q in queues.values():
                     if user in q:
                         q.remove(user)
+                code, body = j({"ok": True})
+            elif path == "/api/wait/create":
+                user = str(data.get("user") or "").strip().lower()
+                mode = str(data.get("mode") or "roles")
+                ranked = bool(data.get("ranked", True))
+                if user not in users:
+                    code, body = j({"error": "login"}, 401)
+                else:
+                    for c, w in list(wait_rooms.items()):
+                        if user in w.get("players", []):
+                            w["players"] = [p for p in w["players"] if p != user]
+                            if not w["players"] and not w.get("match_id"):
+                                del wait_rooms[c]
+                    code_s = make_code()
+                    wait_rooms[code_s] = {
+                        "host": user, "players": [user], "mode": mode,
+                        "ranked": ranked, "created": time.time(), "match_id": None,
+                    }
+                    set_activity(user, "wait", lobby_code=code_s)
+                    code, body = j({"ok": True, "code": code_s, "players": [public_user(user)], "waiting": True})
+            elif path == "/api/wait/join":
+                user = str(data.get("user") or "").strip().lower()
+                code_s = str(data.get("code") or "").strip().upper()
+                friend = str(data.get("friend") or "").strip().lower()
+                if friend and not code_s:
+                    for c, w in wait_rooms.items():
+                        if friend in w.get("players", []) and not w.get("match_id"):
+                            code_s = c
+                            break
+                w = wait_rooms.get(code_s)
+                if user not in users:
+                    code, body = j({"error": "login"}, 401)
+                elif not w:
+                    code, body = j({"error": "friend not waiting"}, 404)
+                elif w.get("match_id"):
+                    code, body = j({"ok": True, "code": code_s, "match_id": w["match_id"], "already": True})
+                elif user in w["players"]:
+                    set_activity(user, "wait", lobby_code=code_s)
+                    code, body = j({"ok": True, "code": code_s, "players": [public_user(p) for p in w["players"]], "waiting": len(w["players"]) < 2})
+                elif len(w["players"]) >= 4:
+                    code, body = j({"error": "full"}, 400)
+                else:
+                    w["players"].append(user)
+                    set_activity(user, "wait", lobby_code=code_s)
+                    body_d = {"ok": True, "code": code_s, "players": [public_user(p) for p in w["players"]]}
+                    if len(w["players"]) >= 2 and not w.get("match_id"):
+                        started = _start_wait_match(w, code_s)
+                        body_d["match_id"] = started["id"]
+                        body_d["start_at"] = started["start_at"]
+                        body_d["roles"] = started["roles"]
+                        body_d["waiting"] = False
+                    else:
+                        body_d["waiting"] = True
+                    code, body = j(body_d)
+            elif path == "/api/wait/leave":
+                user = str(data.get("user") or "").strip().lower()
+                for c, w in list(wait_rooms.items()):
+                    if user in w.get("players", []):
+                        w["players"] = [p for p in w["players"] if p != user]
+                        if not w["players"]:
+                            del wait_rooms[c]
+                set_activity(user, "idle")
                 code, body = j({"ok": True})
             elif path == "/api/match/pos":
                 mid = str(data.get("match_id") or "").strip()
