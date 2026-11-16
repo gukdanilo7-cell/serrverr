@@ -20,6 +20,13 @@ queues: dict = {"first_win": [], "first_die": [], "roles": []}  # roles = asymme
 # Persist accounts so Render restarts / sleep don't wipe friends & elo
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 DATA_FILE = os.path.join(DATA_DIR, "tetrun_users.json")
+MAX_AVATAR = 60000  # ~60KB data-URL cap
+
+def clamp_avatar(av):
+    av = str(av or "")
+    if len(av) > MAX_AVATAR:
+        return ""  # too big — drop rather than break JSON
+    return av
 
 def save_users():
     try:
@@ -30,7 +37,7 @@ def save_users():
                 "nick": rec.get("nick", u),
                 "elo": int(rec.get("elo", 1000)),
                 "friends": list(rec.get("friends") or []),
-                "avatar": rec.get("avatar") or "",
+                "avatar": clamp_avatar(rec.get("avatar") or ""),
                 "stats": rec.get("stats") or {},
             }
         tmp = DATA_FILE + ".tmp"
@@ -150,15 +157,17 @@ def try_matchmake(mode):
     b = q.pop(0)
     mid = uuid.uuid4().hex[:12]
     roles = assign_roles(a, b) if mode == "roles" else {a: "runner", b: "runner"}
+    start_at = time.time() + 3.0
     matches[mid] = {
-        "id": mid, "a": a, "b": b, "mode": mode,
-        "status": "playing", "ranked": True,
+        "id": mid, "a": a, "b": b, "players": [a, b], "mode": mode,
+        "status": "countdown", "ranked": True,
         "roles": roles,
         "events": {a: None, b: None},
         "pos": {a: None, b: None},
-        "blocks": [],  # thrown pieces for runner
+        "blocks": [],
         "block_seq": 0,
-        "started": time.time(), "winner": None, "loser": None,
+        "start_at": start_at,
+        "started": start_at, "winner": None, "loser": None, "alive": [a, b],
     }
     return matches[mid]
 
@@ -167,14 +176,24 @@ def finish_match(m, winner, loser):
     m["status"] = "done"
     m["winner"] = winner
     m["loser"] = loser
-    if m.get("ranked") and winner in users and loser in users:
-        ra = users[winner]["elo"]
-        rb = users[loser]["elo"]
-        na, nb = elo_update(ra, rb, 1)
+    m["elo_before"] = {}
+    m["elo_delta"] = {}
+    if winner in users and loser in users:
+        ra = int(users[winner].get("elo", 1000))
+        rb = int(users[loser].get("elo", 1000))
+        m["elo_before"] = {winner: ra, loser: rb}
+        # ranked: full K=32; friendly lobby: half effect via double-call style — use K=16 by scaling
+        if m.get("ranked"):
+            na, nb = elo_update(ra, rb, 1)
+        else:
+            # half strength
+            ea = 1 / (1 + 10 ** ((rb - ra) / 400))
+            na = int(round(ra + 16 * (1 - ea)))
+            nb = int(round(rb + 16 * (0 - (1 - ea))))
         users[winner]["elo"] = na
         users[loser]["elo"] = nb
         m["elo"] = {winner: na, loser: nb}
-        # bump stats
+        m["elo_delta"] = {winner: na - ra, loser: nb - rb}
         sw = users[winner].setdefault("stats", {})
         sl = users[loser].setdefault("stats", {})
         sw["wins"] = int(sw.get("wins", 0)) + 1
@@ -246,14 +265,17 @@ class Handler(BaseHTTPRequestHandler):
                 if not lob:
                     code, body = j({"error": "not found"}, 404)
                 else:
+                    pl = lob.get("players") or ([lob["host"]] + ([lob["guest"]] if lob.get("guest") else []))
                     code, body = j({
                         "code": code_s,
                         "host": public_user(lob["host"]),
                         "guest": public_user(lob["guest"]) if lob.get("guest") else None,
+                        "players": [public_user(p) for p in pl if p in users],
                         "mode": lob["mode"],
                         "status": lob["status"],
                         "match_id": lob.get("match_id"),
                         "roles": lob.get("roles"),
+                        "start_at": lob.get("start_at"),
                     })
             elif path == "/api/queue/status":
                 user = (qs.get("user") or [""])[0].lower()
@@ -275,20 +297,26 @@ class Handler(BaseHTTPRequestHandler):
                 if not m:
                     code, body = j({"error": "not found"}, 404)
                 else:
+                    if m.get("status") == "countdown" and time.time() >= float(m.get("start_at") or 0):
+                        m["status"] = "playing"
+                    pl = m.get("players") or [m["a"], m["b"]]
                     code, body = j({
                         "id": m["id"], "mode": m["mode"], "status": m["status"],
                         "ranked": m.get("ranked", False),
                         "a": public_user(m["a"]), "b": public_user(m["b"]),
+                        "players": [public_user(p) for p in pl if p in users],
                         "roles": m.get("roles") or {},
                         "events": m["events"], "winner": m.get("winner"),
-                        "loser": m.get("loser"), "elo": m.get("elo"),
+                        "loser": m.get("loser"), "elo": m.get("elo"), "elo_delta": m.get("elo_delta"), "elo_before": m.get("elo_before"),
                         "pos": m.get("pos") or {},
                         "blocks": m.get("blocks") or [],
                         "block_seq": m.get("block_seq", 0),
+                        "start_at": m.get("start_at"),
+                        "server_now": time.time(),
                     })
             elif path == "/api/top":
                 top = sorted(users.keys(), key=lambda x: users[x].get("elo", 1000), reverse=True)[:30]
-                code, body = j({"top": [public_user(x) for x in top]})
+                code, body = j({"top": [public_user(x, full=True) for x in top]})
             elif path == "/api/search":
                 q = (qs.get("q") or [""])[0].lower().strip()
                 found = []
@@ -339,7 +367,7 @@ class Handler(BaseHTTPRequestHandler):
                     if data.get("nick"):
                         rec["nick"] = str(data["nick"])[:16]
                     if data.get("avatar") is not None:
-                        rec["avatar"] = str(data.get("avatar") or "")[:200000]
+                        rec["avatar"] = clamp_avatar(str(data.get("avatar") or "")[:MAX_AVATAR])
                     if data.get("stats") and isinstance(data["stats"], dict):
                         st = rec.setdefault("stats", {})
                         for k in ("wins", "losses", "streak", "best", "points", "games", "timeSec", "pacBest"):
@@ -406,9 +434,12 @@ class Handler(BaseHTTPRequestHandler):
                             del lobbies[c]
                     code_s = make_code()
                     lobbies[code_s] = {
-                        "host": user, "guest": None, "mode": mode,
+                        "host": user,
+                        "players": [user],
+                        "mode": mode,
                         "status": "open", "created": time.time(),
                         "match_id": None, "roles": None,
+                        "start_at": None,
                     }
                     touch(user)
                     code, body = j({"ok": True, "code": code_s, "mode": mode})
@@ -422,46 +453,74 @@ class Handler(BaseHTTPRequestHandler):
                     code, body = j({"error": "lobby not found"}, 404)
                 elif lob["status"] != "open":
                     code, body = j({"error": "lobby closed"}, 400)
-                elif lob["host"] == user:
-                    code, body = j({"error": "already host"}, 400)
-                elif lob.get("guest"):
-                    code, body = j({"error": "full"}, 400)
                 else:
-                    lob["guest"] = user
-                    touch(user)
-                    code, body = j({"ok": True, "code": code_s, "host": public_user(lob["host"]), "mode": lob["mode"]})
+                    pl = lob.setdefault("players", [lob["host"]])
+                    if user in pl:
+                        touch(user)
+                        code, body = j({"ok": True, "code": code_s, "mode": lob["mode"], "players": [public_user(p) for p in pl]})
+                    elif len(pl) >= 4:
+                        code, body = j({"error": "full (max 4)"}, 400)
+                    else:
+                        pl.append(user)
+                        # legacy
+                        if not lob.get("guest") and user != lob["host"]:
+                            lob["guest"] = user
+                        touch(user)
+                        code, body = j({"ok": True, "code": code_s, "mode": lob["mode"], "players": [public_user(p) for p in pl]})
             elif path == "/api/lobby/start":
                 user = str(data.get("user") or "").strip().lower()
                 code_s = str(data.get("code") or "").strip().upper()
                 lob = lobbies.get(code_s)
-                if not lob or lob["host"] != user or not lob.get("guest"):
-                    code, body = j({"error": "cannot start"}, 400)
+                pl = (lob or {}).get("players") or []
+                if not lob or lob["host"] != user:
+                    code, body = j({"error": "only host can start"}, 400)
+                elif len(pl) < 2:
+                    code, body = j({"error": "need at least 2 players"}, 400)
                 else:
                     mid = uuid.uuid4().hex[:12]
-                    a, b = lob["host"], lob["guest"]
                     mode = lob["mode"]
-                    roles = assign_roles(a, b) if mode == "roles" else {a: "runner", b: "runner"}
+                    # assign roles for multi
+                    roles = {}
+                    if mode == "roles":
+                        # one thrower random, rest runners
+                        thrower = random.choice(pl)
+                        for p in pl:
+                            roles[p] = "thrower" if p == thrower else "runner"
+                    else:
+                        for p in pl:
+                            roles[p] = "runner"
+                    start_at = time.time() + 3.0  # 3s countdown
+                    a, b = pl[0], pl[1] if len(pl) > 1 else pl[0]
                     matches[mid] = {
-                        "id": mid, "a": a, "b": b, "mode": mode,
-                        "status": "playing", "ranked": False,
+                        "id": mid, "a": a, "b": b,
+                        "players": list(pl),
+                        "mode": mode,
+                        "status": "countdown",  # then playing
+                        "ranked": False,
                         "roles": roles,
-                        "events": {a: None, b: None},
-                        "pos": {a: None, b: None},
+                        "events": {p: None for p in pl},
+                        "pos": {p: None for p in pl},
                         "blocks": [],
                         "block_seq": 0,
-                        "started": time.time(), "winner": None, "loser": None,
+                        "start_at": start_at,
+                        "started": start_at,
+                        "winner": None, "loser": None, "alive": list(pl),
                     }
-                    lob["status"] = "playing"
+                    lob["status"] = "countdown"
                     lob["match_id"] = mid
                     lob["roles"] = roles
-                    code, body = j({"ok": True, "match_id": mid, "mode": mode, "roles": roles})
+                    lob["start_at"] = start_at
+                    code, body = j({"ok": True, "match_id": mid, "mode": mode, "roles": roles, "start_at": start_at, "players": pl})
             elif path == "/api/lobby/leave":
                 user = str(data.get("user") or "").strip().lower()
                 for c, lob in list(lobbies.items()):
+                    pl = lob.get("players") or []
                     if lob["host"] == user:
                         del lobbies[c]
-                    elif lob.get("guest") == user:
-                        lob["guest"] = None
+                    elif user in pl:
+                        lob["players"] = [p for p in pl if p != user]
+                        if lob.get("guest") == user:
+                            lob["guest"] = None
                         lob["status"] = "open"
                         lob["match_id"] = None
                         lob["roles"] = None
@@ -519,8 +578,10 @@ class Handler(BaseHTTPRequestHandler):
                 roles = (m or {}).get("roles") or {}
                 if not m or user not in (m["a"], m["b"]):
                     code, body = j({"error": "bad match"}, 400)
-                elif m["status"] != "playing":
+                elif m["status"] not in ("playing", "countdown"):
                     code, body = j({"error": "match over"}, 400)
+                elif m["status"] == "countdown":
+                    code, body = j({"error": "wait for start"}, 400)
                 elif roles.get(user) not in ("thrower", None) and m.get("mode") == "roles":
                     code, body = j({"error": "only thrower"}, 403)
                 else:
@@ -588,7 +649,7 @@ class Handler(BaseHTTPRequestHandler):
                     code, body = j({
                         "ok": True, "status": m["status"],
                         "winner": m.get("winner"), "loser": m.get("loser"),
-                        "elo": m.get("elo"), "roles": roles,
+                        "elo": m.get("elo"), "elo_delta": m.get("elo_delta"), "elo_before": m.get("elo_before"), "roles": roles,
                     })
             else:
                 code, body = j({"error": "not found"}, 404)
