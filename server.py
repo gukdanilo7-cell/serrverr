@@ -15,7 +15,8 @@ lock = threading.RLock()
 users: dict = {}
 lobbies: dict = {}
 matches: dict = {}
-queues: dict = {"first_win": [], "first_die": [], "roles": []}  # roles = asymmetric runner vs thrower
+queues: dict = {"first_win": [], "first_die": [], "roles": []}
+rooms: dict = {}  # match_id -> {user: {x,y,nick,...}}
 
 # Persist accounts so Render restarts / sleep don't wipe friends & elo
 DATA_DIR = os.environ.get("DATA_DIR", ".")
@@ -581,16 +582,24 @@ class Handler(BaseHTTPRequestHandler):
                         q.remove(user)
                 code, body = j({"ok": True})
             elif path == "/api/match/pos":
-                mid = str(data.get("match_id") or "")
+                mid = str(data.get("match_id") or "").strip()
                 user = str(data.get("user") or "").strip().lower()
-                m = matches.get(mid)
-                pl = (m or {}).get("players") or ([m["a"], m["b"]] if m else [])
-                if not m or user not in pl:
-                    code, body = j({"error": "bad match"}, 400)
+                if not mid or not user:
+                    code, body = j({"error": "need match_id and user"}, 400)
                 else:
-                    if m.get("status") == "countdown" and time.time() >= float(m.get("start_at") or 0):
-                        m["status"] = "playing"
-                    m.setdefault("pos", {})[user] = {
+                    m = matches.get(mid)
+                    if m:
+                        pl = m.setdefault("players", [m.get("a"), m.get("b")])
+                        pl = [p for p in pl if p]
+                        if user not in pl and len(pl) < 6:
+                            pl.append(user)
+                        m["players"] = pl
+                        if m.get("status") == "countdown" and time.time() >= float(m.get("start_at") or 0):
+                            m["status"] = "playing"
+                        touch(user)
+                    room = rooms.setdefault(mid, {})
+                    room[user] = {
+                        "user": user,
                         "x": float(data.get("x", 0)),
                         "y": float(data.get("y", 0)),
                         "face": bool(data.get("face", True)),
@@ -600,7 +609,23 @@ class Handler(BaseHTTPRequestHandler):
                         "won": bool(data.get("won")),
                         "t": time.time(),
                     }
-                    code, body = j({"ok": True, "pos": m["pos"], "blocks": m.get("blocks") or [], "block_seq": m.get("block_seq", 0), "status": m["status"], "winner": m.get("winner")})
+                    now = time.time()
+                    for k in list(room.keys()):
+                        if now - room[k].get("t", 0) > 8:
+                            del room[k]
+                    if m is not None:
+                        m["pos"] = dict(room)
+                    code, body = j({
+                        "ok": True,
+                        "pos": room,
+                        "peers": list(room.keys()),
+                        "peer_count": len(room),
+                        "blocks": (m.get("blocks") if m else []) or [],
+                        "block_seq": (m.get("block_seq") if m else 0) or 0,
+                        "status": (m.get("status") if m else "playing") or "playing",
+                        "winner": m.get("winner") if m else None,
+                        "server_now": time.time(),
+                    })
             elif path == "/api/match/throw":
                 mid = str(data.get("match_id") or "")
                 user = str(data.get("user") or "").strip().lower()
