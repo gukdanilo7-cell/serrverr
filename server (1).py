@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""TetRun multiplayer server — pure Python stdlib (no Flask).
+Run:  python server.py
+Uses PORT from env (Render/Railway) or 8765.
+"""
+from __future__ import annotations
+import json, time, uuid, threading, hashlib, random, string, os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+PORT = int(os.environ.get("PORT", "8765"))
+ONLINE_TTL = 30.0
+
+lock = threading.RLock()
+users: dict = {}
+lobbies: dict = {}
+matches: dict = {}
+queues: dict = {"first_win": [], "first_die": [], "roles": []}  # roles = asymmetric runner vs thrower
+
+
+def j(data, code=200):
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return code, body
+
+
+def hash_pass(u, p):
+    return hashlib.sha256(f"{u}::{p}::tetrun-mp".encode()).hexdigest()
+
+
+def public_user(u, full=False):
+    rec = users.get(u) or {}
+    now = time.time()
+    online = (now - rec.get("online", 0)) < ONLINE_TTL
+    out = {
+        "user": u,
+        "nick": rec.get("nick", u),
+        "elo": int(rec.get("elo", 1000)),
+        "online": online,
+        "avatar": rec.get("avatar") or "",
+    }
+    if full:
+        st = rec.get("stats") or {}
+        out["stats"] = {
+            "wins": int(st.get("wins", 0)),
+            "losses": int(st.get("losses", 0)),
+            "streak": int(st.get("streak", 0)),
+            "best": int(st.get("best", 0)),
+            "points": int(st.get("points", 0)),
+            "games": int(st.get("games", 0)),
+            "timeSec": int(st.get("timeSec", 0)),
+            "pacBest": int(st.get("pacBest", 0)),
+        }
+        out["friends"] = [
+            {
+                "user": f,
+                "nick": (users[f].get("nick") if f in users else f),
+                "online": f in users and (now - users[f].get("online", 0)) < ONLINE_TTL,
+                "elo": int(users[f].get("elo", 1000)) if f in users else 0,
+            }
+            for f in rec.get("friends", [])
+        ]
+    return out
+
+
+def touch(u):
+    if u in users:
+        users[u]["online"] = time.time()
+
+
+def elo_update(ra, rb, score_a):
+    ea = 1 / (1 + 10 ** ((rb - ra) / 400))
+    eb = 1 - ea
+    na = ra + 32 * (score_a - ea)
+    nb = rb + 32 * ((1 - score_a) - eb)
+    return int(round(na)), int(round(nb))
+
+
+def make_code():
+    for _ in range(50):
+        c = "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+        if c not in lobbies:
+            return c
+    return uuid.uuid4().hex[:5].upper()
+
+
+def assign_roles(a, b):
+    """Random: one runner, one thrower."""
+    if random.random() < 0.5:
+        return {a: "runner", b: "thrower"}
+    return {a: "thrower", b: "runner"}
+
+
+def try_matchmake(mode):
+    q = queues.setdefault(mode, [])
+    now = time.time()
+    q[:] = [u for u in q if u in users and now - users[u].get("online", 0) < ONLINE_TTL]
+    if len(q) < 2:
+        return None
+    a = q.pop(0)
+    b = q.pop(0)
+    mid = uuid.uuid4().hex[:12]
+    roles = assign_roles(a, b) if mode == "roles" else {a: "runner", b: "runner"}
+    matches[mid] = {
+        "id": mid, "a": a, "b": b, "mode": mode,
+        "status": "playing", "ranked": True,
+        "roles": roles,
+        "events": {a: None, b: None},
+        "started": time.time(), "winner": None, "loser": None,
+    }
+    return matches[mid]
+
+
+def finish_match(m, winner, loser):
+    m["status"] = "done"
+    m["winner"] = winner
+    m["loser"] = loser
+    if m.get("ranked") and winner in users and loser in users:
+        ra = users[winner]["elo"]
+        rb = users[loser]["elo"]
+        na, nb = elo_update(ra, rb, 1)
+        users[winner]["elo"] = na
+        users[loser]["elo"] = nb
+        m["elo"] = {winner: na, loser: nb}
+        # bump stats
+        sw = users[winner].setdefault("stats", {})
+        sl = users[loser].setdefault("stats", {})
+        sw["wins"] = int(sw.get("wins", 0)) + 1
+        sw["games"] = int(sw.get("games", 0)) + 1
+        sw["streak"] = int(sw.get("streak", 0)) + 1
+        sw["best"] = max(int(sw.get("best", 0)), sw["streak"])
+        sl["losses"] = int(sl.get("losses", 0)) + 1
+        sl["games"] = int(sl.get("games", 0)) + 1
+        sl["streak"] = 0
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print("[%s] %s" % (self.log_date_time_string(), fmt % args))
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
+    def _read(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8"))
+        except Exception:
+            return {}
+
+    def _send(self, code, body: bytes):
+        self.send_response(code)
+        self._cors()
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        path = u.path
+        qs = parse_qs(u.query)
+        with lock:
+            if path == "/api/health":
+                code, body = j({"ok": True, "users": len(users), "matches": len(matches), "online":
+                    sum(1 for x in users.values() if time.time() - x.get("online", 0) < ONLINE_TTL)})
+            elif path == "/api/friends":
+                user = (qs.get("user") or [""])[0].lower()
+                if user not in users:
+                    code, body = j({"error": "unknown user"}, 404)
+                else:
+                    touch(user)
+                    fl = [public_user(f) for f in users[user].get("friends", []) if f in users]
+                    code, body = j({"friends": fl, "me": public_user(user, full=True)})
+            elif path == "/api/profile":
+                user = (qs.get("user") or [""])[0].lower()
+                if user not in users:
+                    code, body = j({"error": "not found"}, 404)
+                else:
+                    code, body = j({"ok": True, "profile": public_user(user, full=True)})
+            elif path == "/api/lobby":
+                code_s = (qs.get("code") or [""])[0].upper()
+                lob = lobbies.get(code_s)
+                if not lob:
+                    code, body = j({"error": "not found"}, 404)
+                else:
+                    code, body = j({
+                        "code": code_s,
+                        "host": public_user(lob["host"]),
+                        "guest": public_user(lob["guest"]) if lob.get("guest") else None,
+                        "mode": lob["mode"],
+                        "status": lob["status"],
+                        "match_id": lob.get("match_id"),
+                        "roles": lob.get("roles"),
+                    })
+            elif path == "/api/queue/status":
+                user = (qs.get("user") or [""])[0].lower()
+                touch(user)
+                in_q = None
+                for m, q in queues.items():
+                    if user in q:
+                        in_q = m
+                        break
+                mid = None
+                for m in matches.values():
+                    if m["status"] == "playing" and user in (m["a"], m["b"]):
+                        mid = m["id"]
+                        break
+                code, body = j({"queue": in_q, "match_id": mid})
+            elif path == "/api/match":
+                mid = (qs.get("id") or [""])[0]
+                m = matches.get(mid)
+                if not m:
+                    code, body = j({"error": "not found"}, 404)
+                else:
+                    code, body = j({
+                        "id": m["id"], "mode": m["mode"], "status": m["status"],
+                        "ranked": m.get("ranked", False),
+                        "a": public_user(m["a"]), "b": public_user(m["b"]),
+                        "roles": m.get("roles") or {},
+                        "events": m["events"], "winner": m.get("winner"),
+                        "loser": m.get("loser"), "elo": m.get("elo"),
+                    })
+            elif path == "/api/top":
+                top = sorted(users.keys(), key=lambda x: users[x].get("elo", 1000), reverse=True)[:30]
+                code, body = j({"top": [public_user(x) for x in top]})
+            elif path == "/api/search":
+                q = (qs.get("q") or [""])[0].lower().strip()
+                found = []
+                if q:
+                    for uname, rec in users.items():
+                        if q in uname or q in (rec.get("nick") or "").lower():
+                            found.append(public_user(uname))
+                            if len(found) >= 20:
+                                break
+                code, body = j({"users": found})
+            else:
+                code, body = j({"error": "not found"}, 404)
+        self._send(code, body)
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        data = self._read()
+        with lock:
+            if path == "/api/auth/register":
+                user = str(data.get("user") or "").strip().lower()
+                nick = str(data.get("nick") or user).strip()[:16] or user
+                pw = str(data.get("pass") or "")
+                if len(user) < 3 or len(pw) < 4:
+                    code, body = j({"error": "bad credentials"}, 400)
+                elif user in users:
+                    code, body = j({"error": "taken"}, 409)
+                else:
+                    token = uuid.uuid4().hex
+                    users[user] = {
+                        "pass": hash_pass(user, pw), "nick": nick, "elo": 1000,
+                        "friends": [], "online": time.time(), "token": token,
+                        "avatar": "", "stats": {
+                            "wins": 0, "losses": 0, "streak": 0, "best": 0,
+                            "points": 0, "games": 0, "timeSec": 0, "pacBest": 0,
+                        },
+                    }
+                    code, body = j({"ok": True, "user": public_user(user, full=True), "token": token})
+            elif path == "/api/auth/login":
+                user = str(data.get("user") or "").strip().lower()
+                pw = str(data.get("pass") or "")
+                rec = users.get(user)
+                if not rec or rec["pass"] != hash_pass(user, pw):
+                    code, body = j({"error": "auth"}, 401)
+                else:
+                    rec["token"] = uuid.uuid4().hex
+                    rec["online"] = time.time()
+                    if data.get("nick"):
+                        rec["nick"] = str(data["nick"])[:16]
+                    if data.get("avatar") is not None:
+                        rec["avatar"] = str(data.get("avatar") or "")[:200000]
+                    if data.get("stats") and isinstance(data["stats"], dict):
+                        st = rec.setdefault("stats", {})
+                        for k in ("wins", "losses", "streak", "best", "points", "games", "timeSec", "pacBest"):
+                            if k in data["stats"]:
+                                try:
+                                    st[k] = int(data["stats"][k])
+                                except Exception:
+                                    pass
+                    code, body = j({"ok": True, "user": public_user(user, full=True), "token": rec["token"], "elo": rec["elo"]})
+            elif path == "/api/heartbeat":
+                user = str(data.get("user") or "").strip().lower()
+                if user in users:
+                    touch(user)
+                    if data.get("nick"):
+                        users[user]["nick"] = str(data["nick"])[:16]
+                    if data.get("stats") and isinstance(data["stats"], dict):
+                        st = users[user].setdefault("stats", {})
+                        for k in ("wins", "losses", "streak", "best", "points", "games", "timeSec", "pacBest"):
+                            if k in data["stats"]:
+                                try:
+                                    st[k] = int(data["stats"][k])
+                                except Exception:
+                                    pass
+                    code, body = j({"ok": True, "elo": users[user]["elo"]})
+                else:
+                    code, body = j({"error": "unknown"}, 404)
+            elif path == "/api/friend/add":
+                user = str(data.get("user") or "").strip().lower()
+                fr = str(data.get("friend") or "").strip().lower()
+                if user not in users or fr not in users:
+                    code, body = j({"error": "user not found"}, 404)
+                elif user == fr:
+                    code, body = j({"error": "self"}, 400)
+                else:
+                    if fr not in users[user]["friends"]:
+                        users[user]["friends"].append(fr)
+                    if user not in users[fr]["friends"]:
+                        users[fr]["friends"].append(user)
+                    touch(user)
+                    code, body = j({"ok": True, "friends": [public_user(f) for f in users[user]["friends"] if f in users]})
+            elif path == "/api/friend/remove":
+                user = str(data.get("user") or "").strip().lower()
+                fr = str(data.get("friend") or "").strip().lower()
+                if user in users and fr in users[user]["friends"]:
+                    users[user]["friends"] = [x for x in users[user]["friends"] if x != fr]
+                if fr in users and user in users[fr]["friends"]:
+                    users[fr]["friends"] = [x for x in users[fr]["friends"] if x != user]
+                code, body = j({"ok": True})
+            elif path == "/api/lobby/create":
+                user = str(data.get("user") or "").strip().lower()
+                mode = str(data.get("mode") or "roles")
+                if mode not in ("first_win", "first_die", "roles"):
+                    mode = "roles"
+                if user not in users:
+                    code, body = j({"error": "login on server first"}, 401)
+                else:
+                    for c, lob in list(lobbies.items()):
+                        if lob["host"] == user or lob.get("guest") == user:
+                            del lobbies[c]
+                    code_s = make_code()
+                    lobbies[code_s] = {
+                        "host": user, "guest": None, "mode": mode,
+                        "status": "open", "created": time.time(),
+                        "match_id": None, "roles": None,
+                    }
+                    touch(user)
+                    code, body = j({"ok": True, "code": code_s, "mode": mode})
+            elif path == "/api/lobby/join":
+                user = str(data.get("user") or "").strip().lower()
+                code_s = str(data.get("code") or "").strip().upper()
+                lob = lobbies.get(code_s)
+                if user not in users:
+                    code, body = j({"error": "login"}, 401)
+                elif not lob:
+                    code, body = j({"error": "lobby not found"}, 404)
+                elif lob["status"] != "open":
+                    code, body = j({"error": "lobby closed"}, 400)
+                elif lob["host"] == user:
+                    code, body = j({"error": "already host"}, 400)
+                elif lob.get("guest"):
+                    code, body = j({"error": "full"}, 400)
+                else:
+                    lob["guest"] = user
+                    touch(user)
+                    code, body = j({"ok": True, "code": code_s, "host": public_user(lob["host"]), "mode": lob["mode"]})
+            elif path == "/api/lobby/start":
+                user = str(data.get("user") or "").strip().lower()
+                code_s = str(data.get("code") or "").strip().upper()
+                lob = lobbies.get(code_s)
+                if not lob or lob["host"] != user or not lob.get("guest"):
+                    code, body = j({"error": "cannot start"}, 400)
+                else:
+                    mid = uuid.uuid4().hex[:12]
+                    a, b = lob["host"], lob["guest"]
+                    mode = lob["mode"]
+                    roles = assign_roles(a, b) if mode == "roles" else {a: "runner", b: "runner"}
+                    matches[mid] = {
+                        "id": mid, "a": a, "b": b, "mode": mode,
+                        "status": "playing", "ranked": False,
+                        "roles": roles,
+                        "events": {a: None, b: None},
+                        "started": time.time(), "winner": None, "loser": None,
+                    }
+                    lob["status"] = "playing"
+                    lob["match_id"] = mid
+                    lob["roles"] = roles
+                    code, body = j({"ok": True, "match_id": mid, "mode": mode, "roles": roles})
+            elif path == "/api/lobby/leave":
+                user = str(data.get("user") or "").strip().lower()
+                for c, lob in list(lobbies.items()):
+                    if lob["host"] == user:
+                        del lobbies[c]
+                    elif lob.get("guest") == user:
+                        lob["guest"] = None
+                        lob["status"] = "open"
+                        lob["match_id"] = None
+                        lob["roles"] = None
+                code, body = j({"ok": True})
+            elif path == "/api/queue":
+                user = str(data.get("user") or "").strip().lower()
+                mode = str(data.get("mode") or "roles")
+                if mode not in queues:
+                    mode = "roles"
+                if user not in users:
+                    code, body = j({"error": "login"}, 401)
+                else:
+                    for q in queues.values():
+                        if user in q:
+                            q.remove(user)
+                    queues[mode].append(user)
+                    touch(user)
+                    m = try_matchmake(mode)
+                    if m:
+                        opp = m["b"] if m["a"] == user else m["a"]
+                        code, body = j({
+                            "ok": True, "matched": True, "match_id": m["id"],
+                            "mode": mode, "roles": m["roles"],
+                            "opponent": public_user(opp),
+                            "my_role": m["roles"].get(user),
+                        })
+                    else:
+                        code, body = j({"ok": True, "matched": False, "queue": mode})
+            elif path == "/api/queue/cancel":
+                user = str(data.get("user") or "").strip().lower()
+                for q in queues.values():
+                    if user in q:
+                        q.remove(user)
+                code, body = j({"ok": True})
+            elif path == "/api/match/event":
+                mid = str(data.get("match_id") or "")
+                user = str(data.get("user") or "").strip().lower()
+                ev = str(data.get("event") or "")  # win | die
+                m = matches.get(mid)
+                if not m or user not in (m["a"], m["b"]):
+                    code, body = j({"error": "bad match"}, 400)
+                elif m["status"] != "playing":
+                    code, body = j({"ok": True, "status": m["status"], "winner": m.get("winner"), "roles": m.get("roles")})
+                else:
+                    m["events"][user] = ev
+                    winner = loser = None
+                    mode = m["mode"]
+                    roles = m.get("roles") or {}
+                    # roles mode: runner wins by finishing; runner dies = thrower wins; thrower has no "win" alone
+                    if mode == "roles":
+                        role = roles.get(user)
+                        if role == "runner" and ev == "win":
+                            winner, loser = user, (m["b"] if user == m["a"] else m["a"])
+                        elif role == "runner" and ev == "die":
+                            loser, winner = user, (m["b"] if user == m["a"] else m["a"])
+                        elif role == "thrower" and ev == "die":
+                            # thrower somehow died — runner wins
+                            loser, winner = user, (m["b"] if user == m["a"] else m["a"])
+                    elif mode == "first_win":
+                        if ev == "win":
+                            winner, loser = user, (m["b"] if user == m["a"] else m["a"])
+                    else:  # first_die
+                        if ev == "die":
+                            loser, winner = user, (m["b"] if user == m["a"] else m["a"])
+                    if winner:
+                        finish_match(m, winner, loser)
+                    code, body = j({
+                        "ok": True, "status": m["status"],
+                        "winner": m.get("winner"), "loser": m.get("loser"),
+                        "elo": m.get("elo"), "roles": roles,
+                    })
+            else:
+                code, body = j({"error": "not found"}, 404)
+        self._send(code, body)
+
+
+def main():
+    httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"TetRun MP server on http://0.0.0.0:{PORT}")
+    print("Health: GET /api/health")
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
