@@ -17,6 +17,56 @@ lobbies: dict = {}
 matches: dict = {}
 queues: dict = {"first_win": [], "first_die": [], "roles": []}  # roles = asymmetric runner vs thrower
 
+# Persist accounts so Render restarts / sleep don't wipe friends & elo
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+DATA_FILE = os.path.join(DATA_DIR, "tetrun_users.json")
+
+def save_users():
+    try:
+        payload = {}
+        for u, rec in users.items():
+            payload[u] = {
+                "pass": rec.get("pass", ""),
+                "nick": rec.get("nick", u),
+                "elo": int(rec.get("elo", 1000)),
+                "friends": list(rec.get("friends") or []),
+                "avatar": rec.get("avatar") or "",
+                "stats": rec.get("stats") or {},
+            }
+        tmp = DATA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, DATA_FILE)
+    except Exception as e:
+        print("save_users error:", e)
+
+def load_users():
+    global users
+    try:
+        if not os.path.isfile(DATA_FILE):
+            return
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        for u, rec in (payload or {}).items():
+            users[u] = {
+                "pass": rec.get("pass", ""),
+                "nick": rec.get("nick", u),
+                "elo": int(rec.get("elo", 1000)),
+                "friends": list(rec.get("friends") or []),
+                "avatar": rec.get("avatar") or "",
+                "stats": rec.get("stats") or {
+                    "wins": 0, "losses": 0, "streak": 0, "best": 0,
+                    "points": 0, "games": 0, "timeSec": 0, "pacBest": 0,
+                },
+                "online": 0,
+                "token": "",
+            }
+        print(f"Loaded {len(users)} users from {DATA_FILE}")
+    except Exception as e:
+        print("load_users error:", e)
+
+load_users()
+
 
 def j(data, code=200):
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -105,6 +155,9 @@ def try_matchmake(mode):
         "status": "playing", "ranked": True,
         "roles": roles,
         "events": {a: None, b: None},
+        "pos": {a: None, b: None},
+        "blocks": [],  # thrown pieces for runner
+        "block_seq": 0,
         "started": time.time(), "winner": None, "loser": None,
     }
     return matches[mid]
@@ -131,6 +184,7 @@ def finish_match(m, winner, loser):
         sl["losses"] = int(sl.get("losses", 0)) + 1
         sl["games"] = int(sl.get("games", 0)) + 1
         sl["streak"] = 0
+        save_users()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -228,6 +282,9 @@ class Handler(BaseHTTPRequestHandler):
                         "roles": m.get("roles") or {},
                         "events": m["events"], "winner": m.get("winner"),
                         "loser": m.get("loser"), "elo": m.get("elo"),
+                        "pos": m.get("pos") or {},
+                        "blocks": m.get("blocks") or [],
+                        "block_seq": m.get("block_seq", 0),
                     })
             elif path == "/api/top":
                 top = sorted(users.keys(), key=lambda x: users[x].get("elo", 1000), reverse=True)[:30]
@@ -268,6 +325,7 @@ class Handler(BaseHTTPRequestHandler):
                             "points": 0, "games": 0, "timeSec": 0, "pacBest": 0,
                         },
                     }
+                    save_users()
                     code, body = j({"ok": True, "user": public_user(user, full=True), "token": token})
             elif path == "/api/auth/login":
                 user = str(data.get("user") or "").strip().lower()
@@ -290,6 +348,7 @@ class Handler(BaseHTTPRequestHandler):
                                     st[k] = int(data["stats"][k])
                                 except Exception:
                                     pass
+                    save_users()
                     code, body = j({"ok": True, "user": public_user(user, full=True), "token": rec["token"], "elo": rec["elo"]})
             elif path == "/api/heartbeat":
                 user = str(data.get("user") or "").strip().lower()
@@ -311,8 +370,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/friend/add":
                 user = str(data.get("user") or "").strip().lower()
                 fr = str(data.get("friend") or "").strip().lower()
-                if user not in users or fr not in users:
-                    code, body = j({"error": "user not found"}, 404)
+                if user not in users:
+                    code, body = j({"error": "you are not synced — press Connect first"}, 401)
+                elif fr not in users:
+                    code, body = j({"error": "user not found — friend must Register in game and press Connect on the same server"}, 404)
                 elif user == fr:
                     code, body = j({"error": "self"}, 400)
                 else:
@@ -321,6 +382,7 @@ class Handler(BaseHTTPRequestHandler):
                     if user not in users[fr]["friends"]:
                         users[fr]["friends"].append(user)
                     touch(user)
+                    save_users()
                     code, body = j({"ok": True, "friends": [public_user(f) for f in users[user]["friends"] if f in users]})
             elif path == "/api/friend/remove":
                 user = str(data.get("user") or "").strip().lower()
@@ -329,6 +391,7 @@ class Handler(BaseHTTPRequestHandler):
                     users[user]["friends"] = [x for x in users[user]["friends"] if x != fr]
                 if fr in users and user in users[fr]["friends"]:
                     users[fr]["friends"] = [x for x in users[fr]["friends"] if x != user]
+                save_users()
                 code, body = j({"ok": True})
             elif path == "/api/lobby/create":
                 user = str(data.get("user") or "").strip().lower()
@@ -383,6 +446,9 @@ class Handler(BaseHTTPRequestHandler):
                         "status": "playing", "ranked": False,
                         "roles": roles,
                         "events": {a: None, b: None},
+                        "pos": {a: None, b: None},
+                        "blocks": [],
+                        "block_seq": 0,
                         "started": time.time(), "winner": None, "loser": None,
                     }
                     lob["status"] = "playing"
@@ -430,6 +496,63 @@ class Handler(BaseHTTPRequestHandler):
                     if user in q:
                         q.remove(user)
                 code, body = j({"ok": True})
+            elif path == "/api/match/pos":
+                mid = str(data.get("match_id") or "")
+                user = str(data.get("user") or "").strip().lower()
+                m = matches.get(mid)
+                if not m or user not in (m["a"], m["b"]):
+                    code, body = j({"error": "bad match"}, 400)
+                else:
+                    m.setdefault("pos", {})[user] = {
+                        "x": float(data.get("x", 0)),
+                        "y": float(data.get("y", 0)),
+                        "face": bool(data.get("face", True)),
+                        "state": str(data.get("state") or "idle")[:12],
+                        "nick": str(data.get("nick") or user)[:16],
+                        "t": time.time(),
+                    }
+                    code, body = j({"ok": True, "pos": m["pos"], "blocks": m.get("blocks") or [], "block_seq": m.get("block_seq", 0), "status": m["status"], "winner": m.get("winner")})
+            elif path == "/api/match/throw":
+                mid = str(data.get("match_id") or "")
+                user = str(data.get("user") or "").strip().lower()
+                m = matches.get(mid)
+                roles = (m or {}).get("roles") or {}
+                if not m or user not in (m["a"], m["b"]):
+                    code, body = j({"error": "bad match"}, 400)
+                elif m["status"] != "playing":
+                    code, body = j({"error": "match over"}, 400)
+                elif roles.get(user) not in ("thrower", None) and m.get("mode") == "roles":
+                    code, body = j({"error": "only thrower"}, 403)
+                else:
+                    shape = data.get("shape")
+                    if not isinstance(shape, list) or not shape:
+                        code, body = j({"error": "bad shape"}, 400)
+                    else:
+                        # sanitize shape to 0/1 matrix max 4x4
+                        clean = []
+                        for row in shape[:4]:
+                            if not isinstance(row, list):
+                                continue
+                            clean.append([1 if c else 0 for c in row[:4]])
+                        if not clean:
+                            code, body = j({"error": "bad shape"}, 400)
+                        else:
+                            gx = int(data.get("gx", 0))
+                            gx = max(0, min(9, gx))
+                            m["block_seq"] = int(m.get("block_seq", 0)) + 1
+                            piece = {
+                                "id": m["block_seq"],
+                                "shape": clean,
+                                "gx": gx,
+                                "from": user,
+                                "t": time.time(),
+                            }
+                            bl = m.setdefault("blocks", [])
+                            bl.append(piece)
+                            # keep last 30
+                            if len(bl) > 30:
+                                m["blocks"] = bl[-30:]
+                            code, body = j({"ok": True, "block_seq": m["block_seq"], "id": piece["id"]})
             elif path == "/api/match/event":
                 mid = str(data.get("match_id") or "")
                 user = str(data.get("user") or "").strip().lower()
