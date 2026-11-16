@@ -150,7 +150,19 @@ def assign_roles(a, b):
 def try_matchmake(mode):
     q = queues.setdefault(mode, [])
     now = time.time()
-    q[:] = [u for u in q if u in users and now - users[u].get("online", 0) < ONLINE_TTL]
+    # keep only currently online unique users
+    seen = set()
+    live = []
+    for u in q:
+        if u in seen:
+            continue
+        if u not in users:
+            continue
+        if now - users[u].get("online", 0) >= ONLINE_TTL:
+            continue
+        seen.add(u)
+        live.append(u)
+    q[:] = live
     if len(q) < 2:
         return None
     a = q.pop(0)
@@ -314,6 +326,12 @@ class Handler(BaseHTTPRequestHandler):
                         "start_at": m.get("start_at"),
                         "server_now": time.time(),
                     })
+            elif path == "/api/online":
+                now = time.time()
+                online = [public_user(u) for u, rec in users.items()
+                          if now - rec.get("online", 0) < ONLINE_TTL]
+                online.sort(key=lambda x: -x.get("elo", 0))
+                code, body = j({"online": online, "count": len(online)})
             elif path == "/api/top":
                 top = sorted(users.keys(), key=lambda x: users[x].get("elo", 1000), reverse=True)[:30]
                 code, body = j({"top": [public_user(x, full=True) for x in top]})
@@ -533,6 +551,7 @@ class Handler(BaseHTTPRequestHandler):
                 if user not in users:
                     code, body = j({"error": "login"}, 401)
                 else:
+                    now = time.time()
                     for q in queues.values():
                         if user in q:
                             q.remove(user)
@@ -546,9 +565,15 @@ class Handler(BaseHTTPRequestHandler):
                             "mode": mode, "roles": m["roles"],
                             "opponent": public_user(opp),
                             "my_role": m["roles"].get(user),
+                            "start_at": m.get("start_at"),
                         })
                     else:
-                        code, body = j({"ok": True, "matched": False, "queue": mode})
+                        waiting = len(queues.get(mode, []))
+                        online_n = sum(1 for rec in users.values() if now - rec.get("online", 0) < ONLINE_TTL)
+                        code, body = j({
+                            "ok": True, "matched": False, "queue": mode,
+                            "waiting": waiting, "online": online_n,
+                        })
             elif path == "/api/queue/cancel":
                 user = str(data.get("user") or "").strip().lower()
                 for q in queues.values():
@@ -559,15 +584,20 @@ class Handler(BaseHTTPRequestHandler):
                 mid = str(data.get("match_id") or "")
                 user = str(data.get("user") or "").strip().lower()
                 m = matches.get(mid)
-                if not m or user not in (m["a"], m["b"]):
+                pl = (m or {}).get("players") or ([m["a"], m["b"]] if m else [])
+                if not m or user not in pl:
                     code, body = j({"error": "bad match"}, 400)
                 else:
+                    if m.get("status") == "countdown" and time.time() >= float(m.get("start_at") or 0):
+                        m["status"] = "playing"
                     m.setdefault("pos", {})[user] = {
                         "x": float(data.get("x", 0)),
                         "y": float(data.get("y", 0)),
                         "face": bool(data.get("face", True)),
                         "state": str(data.get("state") or "idle")[:12],
                         "nick": str(data.get("nick") or user)[:16],
+                        "dead": bool(data.get("dead")),
+                        "won": bool(data.get("won")),
                         "t": time.time(),
                     }
                     code, body = j({"ok": True, "pos": m["pos"], "blocks": m.get("blocks") or [], "block_seq": m.get("block_seq", 0), "status": m["status"], "winner": m.get("winner")})
