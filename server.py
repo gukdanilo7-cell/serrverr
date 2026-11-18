@@ -301,6 +301,26 @@ def profile():
         ensure_user(u)
         return jsonify({"user": public_user(u), "friends": [public_user(f) for f in users[u].get("friends", set())]})
 
+
+@app.post("/api/invite")
+def api_invite():
+    data = request.get_json(force=True, silent=True) or {}
+    u = ensure_user(data.get("user"))
+    fr = ensure_user(data.get("friend"))
+    code = (data.get("code") or "").strip().upper()
+    if not u or not fr or not code:
+        return jsonify({"error": "bad"}), 400
+    with LOCK:
+        # store as chat message
+        key = chat_key(u, fr)
+        arr = chats.setdefault(key, [])
+        arr.append({"from": u, "to": fr, "text": "[INVITE] Join lobby "+code, "t": int(now()*1000), "invite": code})
+        chats[key] = arr[-CHAT_MAX:]
+        if fr in online:
+            online[fr]["last_invite"] = {"from": u, "code": code, "t": now()}
+        save()
+        return jsonify({"ok": True, "code": code})
+
 @app.get("/api/top")
 def top():
     with LOCK:
@@ -352,10 +372,21 @@ def lobby_join():
 def lobby_get():
     code = (request.args.get("code") or "").strip().upper()
     with LOCK:
+        prune_online()
         lob = lobbies.get(code)
         if not lob:
             return jsonify({"error": "not found"}), 404
-        return jsonify({"lobby": lob, "players": [public_user(p) for p in lob["players"]]})
+        players = [public_user(p) for p in lob["players"]]
+        return jsonify({
+            "ok": True,
+            "code": lob["code"],
+            "mode": lob.get("mode"),
+            "host": lob.get("host"),
+            "started": bool(lob.get("started")),
+            "match_id": lob.get("match_id"),
+            "lobby": lob,
+            "players": players,
+        })
 
 @app.post("/api/lobby/start")
 def lobby_start():
@@ -370,10 +401,20 @@ def lobby_start():
             return jsonify({"error": "host only"}), 403
         if len(lob["players"]) < 2:
             return jsonify({"error": "need 2 players"}), 400
-        m = new_match([{"user": p} for p in lob["players"]], mode=lob.get("mode") or "roles")
+        mode = lob.get("mode") or "roles"
+        m = new_match([{"user": p} for p in lob["players"]], mode=mode)
         lob["started"] = True
         lob["match_id"] = m["id"]
-        return jsonify({"ok": True, "match_id": m["id"], "match": m, "start_at": m["start_at"]})
+        roles = {p["user"]: p["role"] for p in m["players"]}
+        return jsonify({
+            "ok": True,
+            "match_id": m["id"],
+            "match": m,
+            "start_at": m["start_at"],
+            "mode": mode,
+            "roles": roles,
+            "server_now": now(),
+        })
 
 @app.post("/api/lobby/leave")
 def lobby_leave():
@@ -480,7 +521,13 @@ def match_get():
         m = matches.get(mid)
         if not m:
             return jsonify({"error": "not found"}), 404
-        return jsonify({"match": m})
+        # enrich player nicks
+        players = []
+        for p in m["players"]:
+            pu = public_user(p["user"])
+            players.append({**p, "nick": pu.get("nick"), "elo": pu.get("elo")})
+        out = {**m, "players": players, "server_now": now()}
+        return jsonify({"match": out, **out})
 
 @app.post("/api/match/pos")
 def match_pos():
