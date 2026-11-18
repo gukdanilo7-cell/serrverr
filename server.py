@@ -21,7 +21,21 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
+
+@app.after_request
+def add_cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PUT, DELETE"
+    resp.headers["Access-Control-Max-Age"] = "86400"
+    return resp
+
+@app.route("/api/<path:path>", methods=["OPTIONS"])
+@app.route("/<path:path>", methods=["OPTIONS"])
+def cors_preflight(path=""):
+    return ("", 204)
+
 
 DATA_FILE = os.environ.get("TETRUN_DATA", "tetrun_data.json")
 ONLINE_SEC = 45          # heartbeat timeout
